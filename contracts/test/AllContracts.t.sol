@@ -4,13 +4,13 @@ pragma solidity ^0.8.20;
 import {Test} from "forge-std/Test.sol";
 import {HTT} from "../src/HTToken.sol";
 import {MyNFT} from "../src/MyNFT.sol";
-import {NFTMarket} from "../src/NFTmarket.sol";
+import {NFTMarketOptimized} from "../src/NFTmarketOptimized.sol";
 import {TokenBank} from "../src/TokenBank.sol";
 
 contract AllContractsTest is Test {
     HTT public htToken;
     MyNFT public myNFT;
-    NFTMarket public nftMarket;
+    NFTMarketOptimized public nftMarket;
     TokenBank public tokenBank;
     
     address public owner = address(this);
@@ -26,7 +26,7 @@ contract AllContractsTest is Test {
         myNFT = new MyNFT();
         
         // 部署 NFTmarket
-        nftMarket = new NFTMarket(address(myNFT), address(htToken));
+        nftMarket = new NFTMarketOptimized(address(myNFT), address(htToken));
         
         // 部署 TokenBank
         tokenBank = new TokenBank(address(htToken));
@@ -197,5 +197,185 @@ contract AllContractsTest is Test {
         vm.prank(user1);
         vm.expectRevert();
         tokenBank.withdraw(1000 * 10**18); // 没有存款就取款
+    }
+
+    // 测试 tokensReceived 回调购买功能
+    function testNFTMarketTokensReceived() public {
+        // 先铸造和上架 NFT
+        myNFT.safeMint(user1, "https://example.com/token/1");
+        
+        vm.prank(user1);
+        myNFT.approve(address(nftMarket), 1);
+        
+        vm.prank(user1);
+        nftMarket.list(1, 1000 * 10**18);
+        
+        // 先转移代币到市场合约，然后直接调用 tokensReceived（模拟超额支付）
+        vm.prank(user2);
+        htToken.transfer(address(nftMarket), 1200 * 10**18);
+        
+        // 直接调用 tokensReceived 方法
+        vm.prank(address(htToken));
+        nftMarket.tokensReceived(user2, 1200 * 10**18, abi.encode(uint256(1)));
+        
+        // 检查所有权转移
+        assertEq(myNFT.ownerOf(1), user2);
+        
+        // 检查代币转移（卖家收到1000，买家支付了1200但退回200）
+        assertEq(htToken.balanceOf(user1), 11000 * 10**18); // 10000 + 1000
+        assertEq(htToken.balanceOf(user2), 9000 * 10**18);  // 10000 - 1200 + 200 = 9000
+        
+        // 检查上架状态
+        (, , bool active) = nftMarket.getListing(1);
+        assertFalse(active);
+    }
+
+    // 测试 permitBuy 签名授权购买功能（简化版本，跳过复杂的EIP-712签名）
+    function testNFTMarketPermitBuyRevert() public {
+        // 先铸造和上架 NFT
+        myNFT.safeMint(user1, "https://example.com/token/1");
+        
+        vm.prank(user1);
+        myNFT.approve(address(nftMarket), 1);
+        
+        vm.prank(user1);
+        nftMarket.list(1, 1000 * 10**18);
+        
+        // 测试非白名单用户调用 permitBuy 应该失败
+        uint256 tokenId = 1;
+        uint256 deadline = block.timestamp + 1 hours;
+        
+        // 使用无效签名
+        bytes32 r = bytes32(uint256(1));
+        bytes32 s = bytes32(uint256(2));
+        uint8 v = 27;
+        
+        vm.prank(user1); // user1 不在白名单中
+        vm.expectRevert("Buyer not whitelisted");
+        nftMarket.permitBuy(tokenId, deadline, v, r, s);
+        
+        // 测试过期的 deadline（whitelistSigner 已经在 setUp 中添加到白名单）
+        
+        vm.prank(whitelistSigner);
+        vm.expectRevert("PERMIT_DEADLINE_EXPIRED");
+        nftMarket.permitBuy(tokenId, block.timestamp - 1, v, r, s); // 过期的 deadline
+    }
+
+    // 测试 getAllListings 功能
+    function testGetAllListings() public {
+        // 铸造多个 NFT 并上架
+        myNFT.safeMint(user1, "https://example.com/token/1");
+        myNFT.safeMint(user1, "https://example.com/token/2");
+        myNFT.safeMint(user2, "https://example.com/token/3");
+        
+        // 授权
+        vm.prank(user1);
+        myNFT.setApprovalForAll(address(nftMarket), true);
+        
+        vm.prank(user2);
+        myNFT.approve(address(nftMarket), 3);
+        
+        // 上架 NFT
+        vm.prank(user1);
+        nftMarket.list(1, 1000 * 10**18);
+        
+        vm.prank(user1);
+        nftMarket.list(2, 2000 * 10**18);
+        
+        vm.prank(user2);
+        nftMarket.list(3, 3000 * 10**18);
+        
+        // 获取所有上架信息
+        (
+            uint256[] memory tokenIds,
+            address[] memory sellers,
+            uint256[] memory prices
+        ) = nftMarket.getAllListings();
+        
+        // 验证结果
+        assertEq(tokenIds.length, 3);
+        assertEq(tokenIds[0], 1);
+        assertEq(tokenIds[1], 2);
+        assertEq(tokenIds[2], 3);
+        
+        assertEq(sellers[0], user1);
+        assertEq(sellers[1], user1);
+        assertEq(sellers[2], user2);
+        
+        assertEq(prices[0], 1000 * 10**18);
+        assertEq(prices[1], 2000 * 10**18);
+        assertEq(prices[2], 3000 * 10**18);
+        
+        // 优化版本通过price > 0判断active状态
+        assertTrue(prices[0] > 0);
+        assertTrue(prices[1] > 0);
+        assertTrue(prices[2] > 0);
+    }
+
+    // 测试 setWhitelistBatch 功能
+    function testSetWhitelistBatch() public {
+        // 先添加一些白名单
+        nftMarket.addWhitelist(user1);
+        nftMarket.addWhitelist(user2);
+        
+        // 准备新的白名单数组
+        address[] memory newWhitelists = new address[](2);
+        newWhitelists[0] = address(0x7);
+        newWhitelists[1] = address(0x8);
+        
+        // 优化版本使用addWhitelistBatch替代setWhitelistBatch
+        nftMarket.addWhitelistBatch(newWhitelists);
+        
+        // 验证原有白名单仍然存在
+        assertTrue(nftMarket.isWhitelisted(user1));
+        assertTrue(nftMarket.isWhitelisted(user2));
+        assertTrue(nftMarket.isWhitelisted(whitelistSigner));
+        
+        // 验证新白名单生效
+        assertTrue(nftMarket.isWhitelisted(address(0x7)));
+        assertTrue(nftMarket.isWhitelisted(address(0x8)));
+    }
+
+    // 测试 getWhitelistAddresses 功能
+    function testGetWhitelistAddresses() public {
+        // 添加一些白名单地址
+        nftMarket.addWhitelist(user1);
+        nftMarket.addWhitelist(user2);
+        
+        // 获取白名单地址数组
+        address[] memory whitelistAddresses = nftMarket.getWhitelistAddresses();
+        
+        // 验证结果（注意：whitelistSigner 在 setUp 中已添加）
+        assertEq(whitelistAddresses.length, 3);
+        assertEq(whitelistAddresses[0], whitelistSigner);
+        assertEq(whitelistAddresses[1], user1);
+        assertEq(whitelistAddresses[2], user2);
+    }
+
+    // 测试下架功能（通过购买实现）
+    function testNFTDelisting() public {
+        // 先铸造和上架 NFT
+        myNFT.safeMint(user1, "https://example.com/token/1");
+        
+        vm.prank(user1);
+        myNFT.approve(address(nftMarket), 1);
+        
+        vm.prank(user1);
+        nftMarket.list(1, 1000 * 10**18);
+        
+        // 验证上架状态
+        (, , bool activeBefore) = nftMarket.getListing(1);
+        assertTrue(activeBefore);
+        
+        // 购买后自动下架
+        vm.prank(user2);
+        htToken.approve(address(nftMarket), 1000 * 10**18);
+        
+        vm.prank(user2);
+        nftMarket.buyNFT(1);
+        
+        // 验证下架状态
+        (, , bool activeAfter) = nftMarket.getListing(1);
+        assertFalse(activeAfter);
     }
 }
